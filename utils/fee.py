@@ -6,6 +6,5 @@ def calculate_fee(minutes: int) -> int:
     elif minutes < 40:
         return 3000  # 기본요금
     else:
-        extra_minutes = minutes - 40
-        extra_fee = (extra_minutes // 10) * 1000
-        return 3000 + extra_fee + 1000
+        x_fee = (minutes-40 // 10) * 1000
+        return 3000 + x_fee + 1000
