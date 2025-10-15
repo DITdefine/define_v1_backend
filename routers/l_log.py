@@ -13,38 +13,47 @@ cursor = conn.cursor()
 
 @router.get("/log")
 def list_log(
-    start_date: Optional[str] = Query(None, description="조회 시작 날짜 (YYYY-MM-DD)"),
-    end_date: Optional[str] = Query(None, description="조회 종료 날짜 (YYYY-MM-DD)")
+    start_datetime: Optional[str] = Query(None, description="조회 시작 일시 (YYYY-MM-DD HH:MM:SS)"),
+    end_datetime: Optional[str] = Query(None, description="조회 종료 일시 (YYYY-MM-DD HH:MM:SS)"),
+    plate: Optional[str] = Query(None, description="조회할 차량 번호판 (예: 12가3456)")
 ):
+    """
+    차량 로그 조회 API  
+    - 날짜 + 시간 + 번호판 단위로 조회 가능  
+    - 예: /api/v1/log?plate=12가3456&start_datetime=2025-10-15%2000:00:00&end_datetime=2025-10-15%2023:59:59
+    """
     try:
-        if start_date and end_date:
-            # 기간 조회
-            cursor.execute("""
-                SELECT plate, in_time, out_time, out_check, fee
-                FROM cars
-                WHERE DATE(in_time) BETWEEN ? AND ?
-                ORDER BY in_time ASC
-            """, (start_date, end_date))
-        elif start_date:
-            # 시작일만 지정 → 해당 날짜 조회
-            cursor.execute("""
-                SELECT plate, in_time, out_time, out_check, fee
-                FROM cars
-                WHERE DATE(in_time) = ?
-                ORDER BY in_time ASC
-            """, (start_date,))
+        # 쿼리 조합
+        query = """
+            SELECT plate, in_time, out_time, out_check, fee
+            FROM cars
+            WHERE 1=1
+        """
+        params = []
+
+        if start_datetime and end_datetime:
+            query += " AND DATETIME(in_time) BETWEEN ? AND ?"
+            params += [start_datetime, end_datetime]
+        elif start_datetime:
+            query += " AND DATETIME(in_time) >= ?"
+            params.append(start_datetime)
+        elif end_datetime:
+            query += " AND DATETIME(in_time) <= ?"
+            params.append(end_datetime)
         else:
-            # 날짜 미지정 → 오늘 날짜 조회
-            cursor.execute("""
-                SELECT plate, in_time, out_time, out_check, fee
-                FROM cars
-                WHERE DATE(in_time) = DATE('now')
-                ORDER BY in_time ASC
-            """)
-        
+            query += " AND DATE(in_time) = DATE('now')"
+
+        if plate:
+            query += " AND plate LIKE ?"
+            params.append(f"%{plate}%")  # 일부 검색도 가능
+
+        query += " ORDER BY in_time ASC"
+
+        cursor.execute(query, params)
         cars = cursor.fetchall()
+
         if not cars:
-            raise HTTPException(status_code=404, detail="해당 날짜의 로그가 없습니다.")
+            raise HTTPException(status_code=404, detail="해당 조건의 로그가 없습니다.")
 
         return [
             {
@@ -52,7 +61,8 @@ def list_log(
                 "in_time": in_time,
                 "out_time": out_time,
                 "out_check": bool(out_check),
-                "fee": fee
+                "fee": fee,
+                
             }
             for plate, in_time, out_time, out_check, fee in cars
         ]
