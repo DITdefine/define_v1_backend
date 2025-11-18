@@ -19,6 +19,11 @@ from flask_socketio import SocketIO
 
 from ultralytics import YOLO
 
+import serial
+import time
+
+
+
 # ===================== 환경 변수 =====================
 load_dotenv()
 UPSTAGE_API_KEY = os.getenv("UPSTAGE_API_KEY")
@@ -53,6 +58,26 @@ CORS(app)
 sio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")  # 변수명을 sio로 분리
 
 # ===================== 공유 변수들 =====================
+gate_lock = threading.Lock()
+arduino = serial.Serial(port="/dev/cu.usbmodem14101", baudrate=9600, timeout=1)
+time.sleep(2) 
+
+def openBar():
+    """서보모터를 90도로 이동"""
+    arduino.write(b"open\n")
+
+def closeBar():
+    """서보모터를 0도로 이동"""
+    arduino.write(b"close\n")
+
+def open_gate_sequence():
+    if gate_lock.locked():
+        return  # 이미 동작 중이면 실행하지 않음
+    with gate_lock:
+        openBar()
+        time.sleep(3)
+        closeBar()
+
 latest_frame_lock = threading.Lock()
 latest_frame = None
 
@@ -159,6 +184,7 @@ def save_car_log(car_number, vehicle_class=None):
 
         log_event(f"🅿️ 입차 기록: {car_number} ({vehicle_class})")
     try:
+        threading.Thread(target=open_gate_sequence, daemon=True).start()
         sio.emit("log", "true")
     except Exception:
         pass
