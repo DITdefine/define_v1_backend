@@ -16,7 +16,7 @@ from collections import deque
 from flask import Flask
 from flask_cors import CORS
 from flask_socketio import SocketIO
-
+from flask import request
 from ultralytics import YOLO
 
 import serial
@@ -333,15 +333,16 @@ def home():
 def get_today_overview():
     today = datetime.now().strftime("%Y-%m-%d")
 
-    # 오늘 로그
-    cursor.execute("""
+    # 오늘 날짜와 관련된 로그 (출차 여부 무관)
+    cursor.execute(f"""
         SELECT car_number, vehicle_class, entry_time, exit_time, fee, is_parked
         FROM parking_log
-        WHERE entry_time LIKE ?
-        ORDER BY id DESC
-    """, (today + "%",))
+        WHERE exit_time IS NULL
+           OR DATE(entry_time) = DATE('{today}')
+        ORDER BY entry_time DESC;
+    """)
     rows = cursor.fetchall()
-    logs = [
+    today_logs = [
         {
             "car_number": r[0],
             "vehicle_class": r[1],
@@ -353,16 +354,144 @@ def get_today_overview():
         for r in rows
     ]
 
-    # 현재 주차중 차량 수
+    # 현재 주차 중인 차량 수
     cursor.execute("SELECT COUNT(*) FROM parking_log WHERE is_parked = 1")
     parking_count = cursor.fetchone()[0]
 
-    # 결과 합치기
-    return {
-        "todayLogs": logs,
-        "parkingCount": parking_count
-    }
+    # 시간대별 매출 (오늘 출차 기준)
+    cursor.execute(f"""
+        SELECT STRFTIME('%H', exit_time) AS hour, SUM(fee) as total_fee
+        FROM parking_log
+        WHERE DATE(exit_time) = DATE('{today}')
+        GROUP BY hour
+        ORDER BY hour ASC;
+    """)
+    sales_rows = cursor.fetchall()
+    sales_dict = {r[0]: r[1] for r in sales_rows}
 
+    # 시간대별 이용량 (현재 주차 + 오늘 입차)
+    cursor.execute(f"""
+        SELECT STRFTIME('%H', entry_time) AS hour, COUNT(*) as count
+        FROM parking_log
+        WHERE exit_time IS NULL
+           OR DATE(entry_time) = DATE('{today}')
+        GROUP BY hour
+        ORDER BY hour ASC;
+    """)
+    usage_rows = cursor.fetchall()
+    usage_dict = {r[0]: r[1] for r in usage_rows}
+
+    # 00~23시까지 없는 시간은 0으로 채우기
+    usage = [{"hour": f"{h:02}", "count": usage_dict.get(f"{h:02}", 0)} for h in range(24)]
+    sales = [{"hour": f"{h:02}", "total_fee": sales_dict.get(f"{h:02}", 0)} for h in range(24)]
+
+    # 응답 구조
+    return {
+        "todayLogs": today_logs,
+        "parkingCount": parking_count,
+        "log": {
+            "usage": usage,
+            "sales": sales
+        }
+    }
+@app.route("/searchOverview", methods=["GET"])
+def search_overview():
+    # query params
+    start_time = request.args.get("start_time")  # ex: "2025-09-17 08:00" or "25-09-17" or "2025"
+    end_time   = request.args.get("end_time")    # ex: "2025-09-18 18:00"
+    car_number = request.args.get("car_number")  # ex: "12가1234"
+
+    # ----------------------------
+    # 기간 처리
+    # ----------------------------
+    # 단일 날짜: "25-09-17" -> 2025-09-17 00:00 ~ 23:59
+    # 년도만: "2025" -> 2025-01-01 00:00 ~ 2025-12-31 23:59
+    try:
+        if start_time and len(start_time) == 4 and start_time.isdigit():  # 년도 검색
+            start_time_dt = datetime.strptime(start_time, "%Y")
+            start_time = start_time_dt.strftime("%Y-01-01 00:00:00")
+            end_time = start_time_dt.strftime("%Y-12-31 23:59:59")
+        elif start_time and len(start_time) == 8:  # "25-09-17"
+            start_time_dt = datetime.strptime(start_time, "%y-%m-%d")
+            start_time = start_time_dt.strftime("%Y-%m-%d 00:00:00")
+            if not end_time:
+                end_time = start_time_dt.strftime("%Y-%m-%d 23:59:59")
+        elif start_time and end_time:  # 날짜+시간 범위 그대로 사용
+            start_time = start_time
+            end_time = end_time
+        else:  # 기본: 오늘 전체
+            today = datetime.now()
+            start_time = today.strftime("%Y-%m-%d 00:00:00")
+            end_time = today.strftime("%Y-%m-%d 23:59:59")
+    except Exception as e:
+        return {"error": f"Invalid date format: {e}"}, 400
+
+    # 차량번호 조건
+    car_filter = f"AND car_number='{car_number}'" if car_number else ""
+
+    # ----------------------------
+    # todayLogs 조회 (기간+차량번호)
+    # ----------------------------
+    cursor.execute(f"""
+        SELECT car_number, vehicle_class, entry_time, exit_time, fee, is_parked
+        FROM parking_log
+        WHERE (entry_time BETWEEN '{start_time}' AND '{end_time}'
+               OR exit_time BETWEEN '{start_time}' AND '{end_time}')
+              {car_filter}
+        ORDER BY entry_time DESC;
+    """)
+    rows = cursor.fetchall()
+    today_logs = [
+        {
+            "car_number": r[0],
+            "vehicle_class": r[1],
+            "entry_time": r[2],
+            "exit_time": r[3],
+            "fee": r[4],
+            "is_parked": r[5]
+        }
+        for r in rows
+    ]
+
+    # ----------------------------
+    # sales: 시간대별 매출 (출차 기준)
+    # ----------------------------
+    cursor.execute(f"""
+        SELECT STRFTIME('%H', exit_time) AS hour, SUM(fee) as total_fee
+        FROM parking_log
+        WHERE exit_time BETWEEN '{start_time}' AND '{end_time}'
+              {car_filter}
+        GROUP BY hour
+        ORDER BY hour ASC;
+    """)
+    sales_rows = cursor.fetchall()
+    sales_dict = {r[0]: r[1] for r in sales_rows}
+    sales = [{"hour": f"{h:02}", "total_fee": sales_dict.get(f"{h:02}", 0)} for h in range(24)]
+
+    # ----------------------------
+    # usage: 시간대별 이용량 (entry 기준)
+    # ----------------------------
+    cursor.execute(f"""
+        SELECT STRFTIME('%H', entry_time) AS hour, COUNT(*) as count
+        FROM parking_log
+        WHERE (entry_time BETWEEN '{start_time}' AND '{end_time}'
+               OR exit_time IS NULL)
+              {car_filter}
+        GROUP BY hour
+        ORDER BY hour ASC;
+    """)
+    usage_rows = cursor.fetchall()
+    usage_dict = {r[0]: r[1] for r in usage_rows}
+    usage = [{"hour": f"{h:02}", "count": usage_dict.get(f"{h:02}", 0)} for h in range(24)]
+
+    # ----------------------------
+    return {
+        "todayLogs": today_logs,
+        "log": {
+            "usage": usage,
+            "sales": sales
+        }
+    }
 # ===================== 서버 시작 지점 =====================
 if __name__ == "__main__":
     # 백그라운드 태스크 등록(Flask-SocketIO 권장 방식)
@@ -371,4 +500,5 @@ if __name__ == "__main__":
     sio.start_background_task(ocr_worker)
 
     # Flask-SocketIO 로 run (eventlet 사용 시)
+
     sio.run(app, host="0.0.0.0", port=5000)
